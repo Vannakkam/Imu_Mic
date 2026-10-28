@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XIAO Sense Recorder</title>
+<style>
+:root{--bg:#f3f5f2;--fg:#17201c;--mut:#5d6b64;--card:#fff;--line:#d3dad5;--acc:#0a7f5a;--rec:#d2352b;--p1:#0a7f5a;--p2:#c27a00;--p3:#3a63c9}
+@media (prefers-color-scheme:dark){:root{--bg:#121816;--fg:#e6ede9;--mut:#8fa196;--card:#1a2220;--line:#2b3733;--acc:#3fd09c;--rec:#ff6b5e;--p1:#3fd09c;--p2:#f0b440;--p3:#7da0ff}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:12px;max-width:760px;margin-inline:auto}
+h1{font-size:1.3rem;margin:4px 0 2px}
+.sub{color:var(--mut);margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+.row{display:flex;flex-wrap:wrap;gap:8px}
+button{font:inherit;font-weight:600;padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;flex:1 1 140px}
+button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+button:disabled{opacity:.4;cursor:not-allowed}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+button.rec{background:var(--rec);border-color:var(--rec);color:#fff}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
+.stat div{border-left:3px solid var(--line);padding-left:8px}
+.stat b{display:block;font-size:1.15rem;font-variant-numeric:tabular-nums}
+.stat span{color:var(--mut);font-size:.8rem}
+#status{font-weight:600}
+#status.on{color:var(--acc)}#status.rec{color:var(--rec)}
+canvas{width:100%;height:120px;display:block;background:var(--bg);border-radius:6px}
+h2{font-size:.95rem;margin:0 0 6px}
+.note{color:var(--mut);font-size:.82rem;margin:6px 0 0}
+</style>
+</head>
+<body>
+<h1>XIAO Sense recorder</h1>
+<p class="sub">IMU 416 Hz and microphone 16 kHz over Bluetooth LE, with Unix epoch timestamps.</p>
+
+<div class="card">
+  <div id="status">Not connected</div>
+  <div class="row" style="margin-top:8px">
+    <button id="bConn" class="pri">Connect</button>
+    <button id="bStart" disabled>Start recording</button>
+    <button id="bStop" disabled>Stop recording</button>
+    <button id="bRef" disabled>Refresh data</button>
+  </div>
+</div>
+
+<div class="card stat">
+  <div><b id="sT">0.0 s</b><span>Recording time</span></div>
+  <div><b id="sI">0</b><span>IMU samples</span></div>
+  <div><b id="sM">0</b><span>Mic samples</span></div>
+  <div><b id="sR">0 / 0</b><span>IMU Hz / mic Hz</span></div>
+  <div><b id="sL">0</b><span>Lost packets</span></div>
+  <div><b id="sK">0</b><span>kB/s received</span></div>
+  <div><b id="sP">0 / 0</b><span>IMU / mic packets</span></div>
+  <div><b id="sA">0</b><span>Mic peak (of 32767)</span></div>
+</div>
+
+<div class="card">
+  <h2>Accelerometer (±4 g) — last 3 s</h2><canvas id="cI" width="720" height="240"></canvas>
+  <h2 style="margin-top:10px">Microphone — last 0.2 s</h2><canvas id="cM" width="720" height="240"></canvas>
+</div>
+
+<div class="card">
+  <div class="row">
+    <button id="dI" disabled>Download IMU (.csv)</button>
+    <button id="dM" disabled>Download mic (.wav)</button>
+    <button id="dP" disabled>Download mic packet times (.csv)</button>
+  </div>
+  <p class="note">Open this file from https:// or http://localhost in Chrome or Edge (Android or PC). Web Bluetooth is not available in Firefox or iOS Safari.</p>
+</div>
+
+<script>
+const SVC='19b10000-e8f2-537e-4f6c-d104768a1214',DATA='19b10001-e8f2-537e-4f6c-d104768a1214',CTRL='19b10002-e8f2-537e-4f6c-d104768a1214';
+const MIC_HZ=16000,ACC_LSB=4/32768,GYR_LSB=500/32768;
+const $=id=>document.getElementById(id);
+let dev,ctrl,recording=false,imu,mic,pk,st,liveA,liveM,t0wall=0;
+
+function reset(){
+  imu=[];mic=[];pk=[];liveA=[];liveM=[];
+  st={pi:0,pm:0,peak:0,i:0,m:0,lost:0,last:-1,bytes:0,bad:0,tFirst:0,tLast:0,mark:performance.now(),mi:0,mm:0,mb:0,rateI:0,rateM:0,rateK:0};
+  paint();
+}
+function status(t,c){const s=$('status');s.textContent=t;s.className=c||'';}
+function ui(){
+  const c=!!ctrl;
+  $('bStart').disabled=!c||recording;$('bStop').disabled=!c||!recording;$('bRef').disabled=!c;
+  const has=st.i>0||st.m>0;
+  $('dI').disabled=!st.i;$('dM').disabled=!st.m;$('dP').disabled=!st.m;
+  $('bConn').textContent=c?'Disconnect':'Connect';
+  $('bStart').className=recording?'':'rec';
+}
+const nowUs=()=>Math.round((performance.timeOrigin+performance.now())*1000);
+async function send(bytes){await ctrl.writeValueWithoutResponse(new Uint8Array(bytes));}
+async function syncTime(){
+  const b=new DataView(new ArrayBuffer(9));b.setUint8(0,3);b.setBigUint64(1,BigInt(nowUs()),true);
+  await send(new Uint8Array(b.buffer));
+}
+
+const tmo=(p,ms,w)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>r(new Error(w+' timed out')),ms))]);
+async function openGatt(){
+  for(let a=1;a<=3;a++){
+    try{status('Step 1/4: opening GATT connection (attempt '+a+' of 3)…');return await tmo(dev.gatt.connect(),25000,'GATT connect');}
+    catch(e){try{dev.gatt.disconnect();}catch(_){}if(a===3)throw e;await new Promise(r=>setTimeout(r,1500));}
+  }
+}
+async function connect(){
+  try{
+    dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
+    dev.addEventListener('gattserverdisconnected',onDisc);
+    const srv=await openGatt();
+    status('Step 2/4: finding service…');
+    const s=await tmo(srv.getPrimaryService(SVC),10000,'Service discovery');
+    status('Step 3/4: finding characteristics…');
+    ctrl=await tmo(s.getCharacteristic(CTRL),10000,'Control characteristic');
+    const d=await tmo(s.getCharacteristic(DATA),10000,'Data characteristic');
+    d.addEventListener('characteristicvaluechanged',onData);
+    status('Step 4/4: enabling notifications…');
+    await tmo(d.startNotifications(),10000,'Notifications');
+    await syncTime();
+    status('Connected to '+(dev.name||'device')+', time synced','on');
+  }catch(e){status('Connection failed: '+e.message);ctrl=null;try{dev.gatt.disconnect();}catch(_){}}
+  ui();
+}
+function onDisc(){ctrl=null;recording=false;status('Disconnected. Captured data is kept for download.');ui();}
+
+async function start(){
+  reset();await syncTime();t0wall=performance.now();
+  status('Recording…','rec');recording=true;await send([1]);ui();
+}
+async function stop(){await send([2]);recording=false;status('Stopped. Ready to download.','on');ui();}
+async function refresh(){
+  const was=recording;reset();
+  if(ctrl){await syncTime();if(was)t0wall=performance.now();}
+  ui();
+}
+
+function onData(e){
+  const v=e.target.value,len=v.byteLength;
+  if(len<12)return;
+  const type=v.getUint8(0),seq=v.getUint16(1,true),t0=Number(v.getBigUint64(3,true)),n=v.getUint8(11);
+  if(type===3){const m={1:'Mic failed to start on the board, recording IMU only.',2:'IMU not found on the board, recording mic only.'};status(m[n]||('Board status '+n),'rec');return;}
+  if(!recording)return;
+  const need=12+n*(type===1?14:2);
+  if(need!==len){if(!st.bad++)status('Packets truncated ('+len+' of '+need+' bytes): BLE MTU too small. Check the sketch and ArduinoBLE version.','rec');return;}
+  if(st.last>=0)st.lost+=(seq-st.last-1)&0xFFFF;
+  st.last=seq;st.bytes+=len;st.mb+=len;
+  if(type===1){
+    const t=new Float64Array(n),d=new Int16Array(n*6);
+    for(let i=0;i<n;i++){
+      const o=12+i*14;t[i]=t0+v.getUint16(o,true)*16;
+      for(let j=0;j<6;j++)d[i*6+j]=v.getInt16(o+2+j*2,true);
+      liveA.push([d[i*6+3],d[i*6+4],d[i*6+5]]);
+    }
+    imu.push({t,d});st.i+=n;st.mi+=n;st.pi++;
+    if(liveA.length>1250)liveA.splice(0,liveA.length-1250);
+  }else if(type===2){
+    const d=new Int16Array(n);
+    for(let i=0;i<n;i++){d[i]=v.getInt16(12+i*2,true);liveM.push(d[i]);}
+    mic.push(d);pk.push({seq,t0,n});st.m+=n;st.mm+=n;st.pm++;st.peak=d.reduce((a,x)=>Math.max(a,Math.abs(x)),0);
+    if(liveM.length>4000)liveM.splice(0,liveM.length-4000);
+  }
+  if(!st.tFirst)st.tFirst=t0;
+}
+
+function plot(c,series,lim,cols){
+  const x=c.getContext('2d'),W=c.width,H=c.height;
+  const css=getComputedStyle(document.documentElement);
+  x.clearRect(0,0,W,H);
+  x.strokeStyle=css.getPropertyValue('--line');x.beginPath();x.moveTo(0,H/2);x.lineTo(W,H/2);x.stroke();
+  series.forEach((s,k)=>{
+    x.strokeStyle=css.getPropertyValue(cols[k]);x.lineWidth=1.5;x.beginPath();
+    const n=s.length;
+    for(let i=0;i<n;i++){
+      const px=i/Math.max(n-1,1)*W,py=H/2-Math.max(-1,Math.min(1,s[i]/lim))*H/2;
+      i?x.lineTo(px,py):x.moveTo(px,py);
+    }
+    x.stroke();
+  });
+}
+function paint(){
+  const now=performance.now(),dt=(now-st.mark)/1000;
+  if(dt>=1){st.rateI=st.mi/dt;st.rateM=st.mm/dt;st.rateK=st.mb/dt/1000;st.mi=st.mm=st.mb=0;st.mark=now;}
+  $('sT').textContent=(recording?(now-t0wall)/1000:0).toFixed(1)+' s';
+  $('sI').textContent=st.i.toLocaleString();$('sM').textContent=st.m.toLocaleString();
+  $('sR').textContent=Math.round(st.rateI)+' / '+Math.round(st.rateM);
+  $('sL').textContent=st.lost+(st.bad?' (+'+st.bad+' bad)':'');
+  $('sK').textContent=st.rateK.toFixed(1);
+  $('sP').textContent=st.pi+' / '+st.pm;$('sA').textContent=st.peak;
+  $('dI').disabled=!st.i;$('dM').disabled=!st.m;$('dP').disabled=!st.m;
+  plot($('cI'),[0,1,2].map(j=>liveA.map(a=>a[j])),16384,['--p1','--p2','--p3']);
+  plot($('cM'),[liveM],16000,['--p1']);
+}
+// accelerometer axis scale: raw 8192 = 1 g, plot ±2 g
+setInterval(()=>{if(st)paint();},100);
+
+function save(name,parts,type){
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(parts,{type}));
+  a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),60000);
+}
+const stamp=()=>Math.round(st.tFirst/1000);
+function dlIMU(){
+  const parts=['epoch_us,epoch_ms,gx_dps,gy_dps,gz_dps,ax_g,ay_g,az_g\n'];
+  for(const c of imu){
+    let s='';
+    for(let i=0;i<c.t.length;i++){
+      const d=c.d,o=i*6;
+      s+=c.t[i]+','+(c.t[i]/1000).toFixed(3)+','+[0,1,2].map(j=>(d[o+j]*GYR_LSB).toFixed(3)).join(',')+','+[3,4,5].map(j=>(d[o+j]*ACC_LSB).toFixed(5)).join(',')+'\n';
+    }
+    parts.push(s);
+  }
+  save('imu_'+stamp()+'.csv',parts,'text/csv');
+}
+function dlWAV(){
+  let total=0;for(const c of mic)total+=c.length;
+  const out=new Uint8Array(44+total*2),h=new DataView(out.buffer);
+  const w=(o,s)=>{for(let i=0;i<s.length;i++)h.setUint8(o+i,s.charCodeAt(i));};
+  w(0,'RIFF');h.setUint32(4,36+total*2,true);w(8,'WAVEfmt ');h.setUint32(16,16,true);h.setUint16(20,1,true);h.setUint16(22,1,true);
+  h.setUint32(24,MIC_HZ,true);h.setUint32(28,MIC_HZ*2,true);h.setUint16(32,2,true);h.setUint16(34,16,true);w(36,'data');h.setUint32(40,total*2,true);
+  let o=44;for(const c of mic){for(let i=0;i<c.length;i++){h.setInt16(o,c[i],true);o+=2;}}
+  save('mic_'+stamp()+'.wav',[out],'audio/wav');
+}
+function dlPK(){
+  let s='seq,epoch_us,epoch_ms,samples,first_sample_index\n',idx=0;
+  for(const p of pk){s+=p.seq+','+p.t0+','+(p.t0/1000).toFixed(3)+','+p.n+','+idx+'\n';idx+=p.n;}
+  save('mic_packets_'+stamp()+'.csv',[s],'text/csv');
+}
+
+$('bConn').onclick=()=>{
+  if(ctrl){dev.gatt.disconnect();return;}
+  if(!navigator.bluetooth){status('Web Bluetooth is not supported here. Use Chrome or Edge over https or localhost.');return;}
+  connect();
+};
+$('bStart').onclick=start;$('bStop').onclick=stop;$('bRef').onclick=refresh;
+$('dI').onclick=dlIMU;$('dM').onclick=dlWAV;$('dP').onclick=dlPK;
+reset();ui();
+</script>
+</body>
+</html>
